@@ -176,6 +176,74 @@ func rtpPayloadBounds(buf []byte, n int) (start, end int, ok bool) {
 	return hlen, end, true
 }
 
+// rtpReorderBuffer restores RTP sequence order before payload assembly.
+// TrackRemote may deliver valid UDP packets out of order; the camera's large
+// fragmented keyframes make that especially visible. A bounded window avoids
+// stalling forever if a packet is genuinely lost.
+type rtpReorderBuffer struct {
+	expected     uint16
+	haveExpected bool
+	window       int
+	pending      map[uint16][]byte
+}
+
+func newRTPReorderBuffer(window int) *rtpReorderBuffer {
+	if window < 1 {
+		window = 1
+	}
+	return &rtpReorderBuffer{window: window, pending: make(map[uint16][]byte)}
+}
+
+func (r *rtpReorderBuffer) Push(packet []byte) [][]byte {
+	if len(packet) < 4 {
+		return [][]byte{append([]byte(nil), packet...)}
+	}
+	seq := binary.BigEndian.Uint16(packet[2:4])
+	if !r.haveExpected {
+		r.expected = seq
+		r.haveExpected = true
+	}
+
+	// uint16 subtraction naturally handles sequence wrap. Values in the upper
+	// half of the sequence space are behind expected and are late/duplicates.
+	if uint16(seq-r.expected) >= 0x8000 {
+		return nil
+	}
+	if _, exists := r.pending[seq]; exists {
+		return nil
+	}
+	r.pending[seq] = append([]byte(nil), packet...)
+
+	out := make([][]byte, 0, 4)
+	for {
+		if pkt, ok := r.pending[r.expected]; ok {
+			delete(r.pending, r.expected)
+			out = append(out, pkt)
+			r.expected++
+			continue
+		}
+		if len(r.pending) < r.window {
+			break
+		}
+
+		// The missing sequence has exceeded the reorder window. Advance to the
+		// nearest packet ahead so one real loss cannot freeze the whole stream.
+		bestDist := uint16(0xffff)
+		var bestSeq uint16
+		for s := range r.pending {
+			d := uint16(s - r.expected)
+			if d < bestDist {
+				bestDist, bestSeq = d, s
+			}
+		}
+		if bestDist == 0xffff || bestDist >= 0x8000 {
+			break
+		}
+		r.expected = bestSeq
+	}
+	return out
+}
+
 func iceServers(vc *VideoCall) []webrtc.ICEServer {
 	var out []webrtc.ICEServer
 	for _, i := range vc.UserICEs {
@@ -435,6 +503,21 @@ func NewViewer(sig *Signaling, vc *VideoCall, uuid, model, callID, ffmpeg, rtspU
 		startCode := []byte{0x00, 0x00, 0x00, 0x01}
 		buf := make([]byte, 2048)
 		detector := keyframeDetector{label: model}
+		reorder := newRTPReorderBuffer(64)
+
+		// Optional diagnostic mirror of the exact post-SRTP RTP bytes returned by
+		// Pion TrackRemote.Read. Set BOMBECAM_RTP_TAP to a loopback UDP address
+		// such as 127.0.0.1:55000. The normal media path is unchanged.
+		var rtpTap net.Conn
+		if target := strings.TrimSpace(os.Getenv("BOMBECAM_RTP_TAP")); target != "" {
+			if conn, err := net.Dial("udp", target); err != nil {
+				fmt.Printf("[%s] [RTP-TAP] dial %s failed: %v\n", model, target, err)
+			} else {
+				rtpTap = conn
+				defer rtpTap.Close()
+				fmt.Printf("[%s] [RTP-TAP] mirroring decrypted video RTP to %s\n", model, target)
+			}
+		}
 
 		for {
 			n, _, err := tr.Read(buf)
@@ -443,88 +526,95 @@ func NewViewer(sig *Signaling, vc *VideoCall, uuid, model, callID, ffmpeg, rtspU
 				v.Close()
 				return
 			}
-			hlen, end, ok := rtpPayloadBounds(buf, n)
-			if !ok {
-				continue
+			if rtpTap != nil {
+				_, _ = rtpTap.Write(buf[:n])
 			}
-
-			v.mu.Lock()
-			v.lastPacketTime = time.Now()
-			v.gotFirstPacket = true
-			stdin := v.ffStdin
-			v.mu.Unlock()
-
-			// Verify active candidate pair is typ host in allowed subnets before triggering OnMediaActive
-			var onActive func()
-			v.mu.Lock()
-			needCheck := !v.mediaActiveTriggered && v.OnMediaActive != nil
-			v.mu.Unlock()
-
-			if needCheck && v.verifyActiveCandidatePair() {
-				v.mu.Lock()
-				if !v.mediaActiveTriggered && v.OnMediaActive != nil {
-					v.mediaActiveTriggered = true
-					onActive = v.OnMediaActive
+			for _, ordered := range reorder.Push(buf[:n]) {
+				buf := ordered
+				n := len(buf)
+				hlen, end, ok := rtpPayloadBounds(buf, n)
+				if !ok {
+					continue
 				}
-				v.mu.Unlock()
-				if onActive != nil {
-					go onActive()
-				}
-			}
 
-			p := buf[hlen:end]
-
-			if sink != nil {
-				sink.OnVideoPacket(p, binary.BigEndian.Uint32(buf[4:8]), buf[1]&0x80 != 0)
-				continue
-			}
-
-			// FFmpeg exited (e.g. MediaMTX restarted): start a new one instead of
-			// silently discarding video for the rest of the session.
-			if stdin == nil {
 				v.mu.Lock()
-				restart := !v.closed && v.ff == nil && time.Since(v.lastFFStart) > 3*time.Second
+				v.lastPacketTime = time.Now()
+				v.gotFirstPacket = true
+				stdin := v.ffStdin
 				v.mu.Unlock()
-				if restart {
-					fmt.Printf("[%s] FFmpeg is not running; restarting it\n", model)
-					if err := v.startFFmpeg(); err != nil {
-						fmt.Printf("[%s] ffmpeg restart error: %v\n", model, err)
-					}
+
+				// Verify active candidate pair is typ host in allowed subnets before triggering OnMediaActive
+				var onActive func()
+				v.mu.Lock()
+				needCheck := !v.mediaActiveTriggered && v.OnMediaActive != nil
+				v.mu.Unlock()
+
+				if needCheck && v.verifyActiveCandidatePair() {
 					v.mu.Lock()
-					stdin = v.ffStdin
+					if !v.mediaActiveTriggered && v.OnMediaActive != nil {
+						v.mediaActiveTriggered = true
+						onActive = v.OnMediaActive
+					}
 					v.mu.Unlock()
+					if onActive != nil {
+						go onActive()
+					}
 				}
-			}
-			if len(p) == 0 {
-				continue
-			}
-			nalType := (p[0] >> 1) & 0x3f
 
-			var pkt []byte
-			if nalType == 49 && len(p) >= 3 {
-				s := (p[2] >> 7) & 1
-				if s == 1 {
-					nalHdr := detector.startHeader(p)
-					firstByte := p[1]
-					pkt = make([]byte, 4+2+len(p[3:]))
-					copy(pkt[0:4], startCode)
-					pkt[4] = nalHdr
-					pkt[5] = firstByte
-					copy(pkt[6:], p[3:])
+				p := buf[hlen:end]
+
+				if sink != nil {
+					sink.OnVideoPacket(p, binary.BigEndian.Uint32(buf[4:8]), buf[1]&0x80 != 0)
+					continue
+				}
+
+				// FFmpeg exited (e.g. MediaMTX restarted): start a new one instead of
+				// silently discarding video for the rest of the session.
+				if stdin == nil {
+					v.mu.Lock()
+					restart := !v.closed && v.ff == nil && time.Since(v.lastFFStart) > 3*time.Second
+					v.mu.Unlock()
+					if restart {
+						fmt.Printf("[%s] FFmpeg is not running; restarting it\n", model)
+						if err := v.startFFmpeg(); err != nil {
+							fmt.Printf("[%s] ffmpeg restart error: %v\n", model, err)
+						}
+						v.mu.Lock()
+						stdin = v.ffStdin
+						v.mu.Unlock()
+					}
+				}
+				if len(p) == 0 {
+					continue
+				}
+				nalType := (p[0] >> 1) & 0x3f
+
+				var pkt []byte
+				if nalType == 49 && len(p) >= 3 {
+					s := (p[2] >> 7) & 1
+					if s == 1 {
+						nalHdr := detector.startHeader(p)
+						firstByte := p[1]
+						pkt = make([]byte, 4+2+len(p[3:]))
+						copy(pkt[0:4], startCode)
+						pkt[4] = nalHdr
+						pkt[5] = firstByte
+						copy(pkt[6:], p[3:])
+					} else {
+						pkt = make([]byte, len(p[3:]))
+						copy(pkt, p[3:])
+					}
 				} else {
-					pkt = make([]byte, len(p[3:]))
-					copy(pkt, p[3:])
+					// Single NAL unit (e.g. SPS or PPS)
+					detector.observeNAL(p)
+					pkt = make([]byte, 4+len(p))
+					copy(pkt[0:4], startCode)
+					copy(pkt[4:], p)
 				}
-			} else {
-				// Single NAL unit (e.g. SPS or PPS)
-				detector.observeNAL(p)
-				pkt = make([]byte, 4+len(p))
-				copy(pkt[0:4], startCode)
-				copy(pkt[4:], p)
-			}
 
-			if len(pkt) > 0 && stdin != nil {
-				_, _ = stdin.Write(pkt)
+				if len(pkt) > 0 && stdin != nil {
+					_, _ = stdin.Write(pkt)
+				}
 			}
 		}
 	})
